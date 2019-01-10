@@ -18,10 +18,6 @@ MOIU.@model(InnerModel,
     ()
 )
 
-# Add UniversalFallback to allow the NLPBlock to be set.
-const Model = MOIU.UniversalFallback{InnerModel{Float64}}
-Base.show(io::IO, ::Model) = println(io, "A MathProgBase model")
-
 "Attribute for the MathProgBase solver."
 struct MPBSolver <: MOI.AbstractModelAttribute end
 
@@ -33,10 +29,13 @@ struct MPBSolver <: MOI.AbstractModelAttribute end
     model = Optimizer(solver = AmplNLWriter("/usr/bin/bonmin"))
 """
 function Optimizer(; solver)
-    model = Model()
-    MOI.set(model, MPBSolver(), solver)
+    model = MOIU.UniversalFallback(InnerModel{Float64}())
     return model
 end
+
+# Make `Model` a constant for use in the rest of the file.
+const Model = MOIU.UniversalFallback{InnerModel{Float64}}
+Base.show(io::IO, ::Model) = println(io, "A MathProgBase model")
 
 set_to_bounds(set::MOI.LessThan) = (-Inf, set.upper)
 set_to_bounds(set::MOI.GreaterThan) = (set.lower, Inf)
@@ -44,6 +43,63 @@ set_to_bounds(set::MOI.EqualTo) = (set.value, set.value)
 set_to_bounds(set::MOI.Interval) = (set.lower, set.upper)
 set_to_cat(set::MOI.ZeroOne) = :Bin
 set_to_cat(set::MOI.Integer) = :Int
+
+struct NLPEvaluator{T <: MOI.AbstractNLPEvaluator} <: MPB.AbstractNLPEvaluator
+    inner::T
+    variable_map::Dict{MOI.VariableIndex, Int}
+end
+
+"""
+MathProgBase expects expressions with variables denoted by `x[i]` for contiguous
+`i`. However, JuMP 0.19 creates expressions with `x[MOI.VariableIndex(i)]`. So
+we have to recursively walk the expression replacing instances of
+MOI.VariableIndex by a corresponding integer.
+"""
+function replace_variableindex_by_int(variable_map, expr::Expr)
+    for (i, arg) in enumerate(expr.args)
+        expr.args[i] = replace_variableindex_by_int(variable_map, arg)
+    end
+    return expr
+end
+function replace_variableindex_by_int(variable_map, expr::MOI.VariableIndex)
+    return variable_map[expr]
+end
+replace_variableindex_by_int(variable_map, expr) = expr
+
+function MPB.initialize(d::NLPEvaluator, requested_features::Vector{Symbol})
+    MOI.initialize(d.inner, requested_features)
+    return
+end
+
+function MPB.features_available(d::NLPEvaluator)
+    return MOI.features_available(d.inner)
+end
+
+function MPB.eval_f(d::NLPEvaluator, x)
+    return MOI.eval_objective(d.inner, x)
+end
+
+function MPB.eval_g(d::NLPEvaluator, g, x)
+    return MOI.eval_constraint(d.inner, g, x)
+end
+
+function MPB.eval_grad_f(d::NLPEvaluator, g, x)
+    return MOI.eval_objective_gradient(d.inner, g, x)
+end
+
+function MPB.jac_structure(d::NLPEvaluator)
+    return MOI.jacobian_structure(d.inner)
+end
+
+function MPB.obj_expr(d::NLPEvaluator)
+    expr = MOI.objective_expr(d.inner)
+    return replace_variableindex_by_int(d.variable_map, expr)
+end
+
+function MPB.constr_expr(d::NLPEvaluator, i)
+    expr = MOI.constraint_expr(d.inner, i)
+    return replace_variableindex_by_int(d.variable_map, expr)
+end
 
 function MOI.optimize!(model::Model)
     mpb_solver = MOI.get(model, MPBSolver())
@@ -83,7 +139,7 @@ function MOI.optimize!(model::Model)
     end
 
     # Get the optimzation sense.
-    opt_sense = MOI.get(model, MOI.OptimizationSense())
+    opt_sense = MOI.get(model, MOI.ObjectiveSense())
     sense = opt_sense == MOI.MAX_SENSE ? :Max : :Min
 
     nlp_block = try
@@ -104,7 +160,7 @@ function MOI.optimize!(model::Model)
     mpb_model = MPB.NonlinearModel(mpb_solver)
     MPB.loadproblem!(
         mpb_model, num_var, num_con, x_l, x_u, g_l, g_u, sense,
-        nlp_block.evaluator
+        NLPEvaluator(nlp_block.evaluator, variable_map)
     )
 
     MPB.setvartype!(mpb_model, x_cat)
@@ -128,17 +184,18 @@ function MOI.optimize!(model::Model)
     elseif status == :Error
         termination_status = MOI.OTHER_ERROR
     end
-    MOI.set(model, MOI.TerminationStatus(), termination_status)
-    MOI.set(model, MOI.PrimalStatus(), primal_status)
-    MOI.set(model, MOI.DualStatus(), dual_status)
+
+    # MOI.set(model, MOI.TerminationStatus(), termination_status)
+    # MOI.set(model, MOI.PrimalStatus(), primal_status)
+    # MOI.set(model, MOI.DualStatus(), dual_status)
 
     x_solution = MPB.getsolution(mpb_model)
     for (variable, sol) in zip(variables, x_solution)
-        MOI.get(model, MOI.VariablePrimal(), variable, sol)
+        # MOI.set(model, MOI.VariablePrimal(), variable, sol)
     end
 
     obj_value = MPB.getobjval(model)
-    MOI.set(model, MOI.ObjectiveValue(), obj_value)
+    # MOI.set(model, MOI.ObjectiveValue(), obj_value)
 
     return
 end
