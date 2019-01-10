@@ -18,8 +18,22 @@ MOIU.@model(InnerModel,
     ()
 )
 
+# Make `Model` a constant for use in the rest of the file.
+const Model = MOIU.UniversalFallback{InnerModel{Float64}}
+
 "Attribute for the MathProgBase solver."
-struct MPBSolver <: MOI.AbstractModelAttribute end
+struct MPBSolver <: MOI.AbstractOptimizerAttribute end
+
+"Attribute for the MathProgBase status."
+struct MPBSolutionAttribute <: MOI.AbstractModelAttribute end
+
+"Struct to contain the MPB solution."
+struct MPBSolution
+    status::Symbol
+    is_minimization::Bool
+    objective_value::Float64
+    primal_solution::Dict{MOI.VariableIndex, Float64}
+end
 
 """
     Optimizer(; solver)
@@ -30,12 +44,38 @@ struct MPBSolver <: MOI.AbstractModelAttribute end
 """
 function Optimizer(; solver)
     model = MOIU.UniversalFallback(InnerModel{Float64}())
+    MOI.set(model, MPBSolver(), solver)
     return model
 end
 
-# Make `Model` a constant for use in the rest of the file.
-const Model = MOIU.UniversalFallback{InnerModel{Float64}}
 Base.show(io::IO, ::Model) = println(io, "A MathProgBase model")
+
+# We re-define is_empty and empty! to prevent the universal fallback from
+# deleting the solver that we are caching in it.
+function MOI.is_empty(model::Model)
+    return MOI.is_empty(model.model) &&
+        isempty(model.constraints) &&
+        isempty(model.modattr) &&
+        isempty(model.varattr) &&
+        isempty(model.conattr) &&
+        length(model.optattr) == 1 &&
+        haskey(model.optattr, MPBSolver())
+end
+
+function MOI.empty!(model::Model)
+    MOI.empty!(model.model)
+    empty!(model.constraints)
+    model.nextconstraintid = 0
+    empty!(model.con_to_name)
+    model.name_to_con = nothing
+    empty!(model.modattr)
+    empty!(model.varattr)
+    empty!(model.conattr)
+    mpb_solver = model.optattr[MPBSolver()]
+    empty!(model.optattr)
+    model.optattr[MPBSolver()] = mpb_solver
+    return
+end
 
 set_to_bounds(set::MOI.LessThan) = (-Inf, set.upper)
 set_to_bounds(set::MOI.GreaterThan) = (set.lower, Inf)
@@ -167,37 +207,74 @@ function MOI.optimize!(model::Model)
 
     MPB.optimize!(mpb_model)
 
-    # Handle statuses.
-    status = MPB.status(mpb_model)
-    termination_status = MOI.OTHER_ERROR
-    primal_status = MOI.NO_SOLUTION
-    dual_status = MOI.NO_SOLUTION
-    if status == :Optimal
-        termination_status = MOI.OPTIMAL
-        primal_status = MOI.FEASIBLE_POINT
-    elseif status == :Infeasible
-        termination_status = MOI.INFEASIBLE
-    elseif status == :Unbounded
-        termination_status = MOI.DUAL_INFEASIBLE
-    elseif status == :UserLimit
-        termination_status = MOI.OTHER_LIMIT
-    elseif status == :Error
-        termination_status = MOI.OTHER_ERROR
+    # MathProbBase solution
+    primal_solution = Dict{MOI.VariableIndex, Float64}()
+    for (variable, sol) in zip(variables, MPB.getsolution(mpb_model))
+        primal_solution[variable] = sol
     end
-
-    # MOI.set(model, MOI.TerminationStatus(), termination_status)
-    # MOI.set(model, MOI.PrimalStatus(), primal_status)
-    # MOI.set(model, MOI.DualStatus(), dual_status)
-
-    x_solution = MPB.getsolution(mpb_model)
-    for (variable, sol) in zip(variables, x_solution)
-        # MOI.set(model, MOI.VariablePrimal(), variable, sol)
-    end
-
-    obj_value = MPB.getobjval(model)
-    # MOI.set(model, MOI.ObjectiveValue(), obj_value)
-
+    MOI.set(model, MPBSolutionAttribute(), MPBSolution(
+        MPB.status(mpb_model),
+        sense == :Min,
+        MPB.getobjval(mpb_model),
+        primal_solution
+    ))
     return
+end
+
+function MOI.get(model::Model, ::MOI.VariablePrimal, var::MOI.VariableIndex)
+    mpb_solution = MOI.get(model, MPBSolutionAttribute())
+    if mpb_solution === nothing
+        return nothing
+    end
+    return mpb_solution.primal_solution[var]
+end
+
+function MOI.get(model::Model, ::MOI.ObjectiveValue)
+    mpb_solution = MOI.get(model, MPBSolutionAttribute())
+    if mpb_solution === nothing
+        return nothing
+    end
+    if mpb_solution.is_minimization
+        return -mpb_solution.objective_value
+    else
+        return mpb_solution.objective_value
+    end
+end
+
+function MOI.get(model::Model, ::MOI.TerminationStatus)
+    mpb_solution = MOI.get(model, MPBSolutionAttribute())
+    if mpb_solution === nothing
+        return MOI.OPTIMIZE_NOT_CALLED
+    end
+    status = mpb_solution.status
+    if status == :Optimal
+        return MOI.OPTIMAL
+    elseif status == :Infeasible
+        return MOI.INFEASIBLE
+    elseif status == :Unbounded
+        return MOI.DUAL_INFEASIBLE
+    elseif status == :UserLimit
+        return MOI.OTHER_LIMIT
+    elseif status == :Error
+        return MOI.OTHER_ERROR
+    end
+    return MOI.OTHER_ERROR
+end
+
+function MOI.get(model::Model, ::MOI.PrimalStatus)
+    mpb_solution = MOI.get(model, MPBSolutionAttribute())
+    if mpb_solution === nothing
+        return MOI.NO_SOLUTION
+    end
+    status = mpb_solution.status
+    if status == :Optimal
+        return MOI.FEASIBLE_POINT
+    end
+    return MOI.NO_SOLUTION
+end
+
+function MOI.get(model::Model, ::MOI.DualStatus)
+    return MOI.NO_SOLUTION
 end
 
 end
